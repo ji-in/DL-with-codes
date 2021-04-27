@@ -4,5 +4,7 @@
 
 ## Adversarial nets
 
-$^{a_{1}}$
+$$
+^{a_{1}}
+$$
 
