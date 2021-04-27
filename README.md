@@ -9,7 +9,7 @@
 
 | 번호 | 논문 제목                                                    | 상태         |
 | ---- | ------------------------------------------------------------ | ------------ |
-| 1    | Generative Adversarial Network (GAN) [NIPS 2014]             | 논문 읽는 중 |
+| 1    | Generative Adversarial Networks (GAN) [NIPS 2014]            | 논문 읽는 중 |
 | 2    | Unsupervised Representation Learning with Deep Convolutional Generative Adversarial Networks (DCGAN) [ICLR 2016] |              |
 | 3    | Infogan: Interpretable representation learning by information maximizing generative adversarial nets [NIPS 2016] |              |
 | 4    | Wasserstein GAN                                              |              |
