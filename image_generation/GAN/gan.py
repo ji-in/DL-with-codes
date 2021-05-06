@@ -1,163 +1,146 @@
 import argparse
 
 import torch
-from torchvision import transforms
 import torch.nn as nn
+from tqdm.auto import tqdm
+from torchvision import transforms
+from torchvision.datasets import MNIST
+from torchvision.utils import make_grid
+from torch.utils.data import DataLoader
 
-import numpy as np
+from model import Generator, Discriminator
+from model import get_noise
+from utils import save_tensor_images
 
-from models import Generator, Discriminator
-from dataset import load_mnist
 
-is_cuda = torch.cuda.is_available()
-device = torch.device('cuda' if is_cuda else 'cpu')
-
+# checkpoint 저장 추가
+# validation 추가 (best model 저장 추가)
+# custom dataset 만들기
+# evaluation 추가
+# 서버 이상 있을 때, checkpoint부터 시작하는 코드 추가
+# 파라미터 초기화 추가
 
 class GAN(object):
-    def __init__(self, args, generator=Generator, discriminator=Discriminator):
+    def __init__(self, args):
         super().__init__()
 
-        # 환경 설정하기
-        self.args = args
-        self.gpu_id = args.gpu_id
+        self.n_epochs = args.n_epochs
+        self.z_dim = args.z_dim
+        self.display_step = args.display_step
         self.batch_size = args.batch_size
-        self.num_epochs = args.num_epochs
+        self.lr = args.lr
 
-        # MNIST 데이터셋 불러오기
-        self.train_loader, self.test_loader = load_mnist()
+        self.crit = nn.BCEWithLogitsLoss()
 
-        # Generator와 Discriminator 초기화하기
-        self.G = generator()
-        self.D = discriminator()
+        self.is_cuda = torch.cuda.is_available()
+        self.device = torch.device('cuda' if self.is_cuda else 'cpu')
 
-        # 로스 함수 - Binary Cross Entropy 사용
-        self.criterion = nn.BCELoss()
+        self.dataloader = DataLoader(
+            MNIST('.', download=False, transform=transforms.ToTensor()),
+            batch_size=self.batch_size,
+            shuffle=True)
 
-        # Optimizer
-        self.d_optimizer = torch.optim.Adam(self.D.parameters(), lr=0.0002)
-        self.g_optimizer = torch.optim.Adam(self.G.parameters(), lr=0.0002)
+        self.gen = Generator(self.z_dim).to(self.device)
+        self.gen_opt = torch.optim.Adam(self.gen.parameters(), lr=self.lr)
 
-    def _train(self):
-        self.G.train()
-        self.D.train()
+        self.disc = Discriminator().to(self.device)
+        self.disc_opt = torch.optim.Adam(self.disc.parameters(), lr=self.lr)
 
-        # train_loader에서 batch크기 만큼 img_batch, label_batch 불러오기
-        for img_batch, label_batch in self.train_loader:
-            img_batch, label_batch = img_batch.to(device), label_batch.to(device)
+    def get_disc_loss(self, real, num_images):
+        fake_noise = get_noise(num_images, self.z_dim)  # 노이즈 생성
+        fake = self.gen(fake_noise)  # 가짜 이미지 생성
 
-            # ====================================================== #
-            # discriminator training 하기
-            # ====================================================== #
+        disc_fake_pred = self.disc(fake.detach())  # 왜 여기만 detach() 했지?
+        disc_fake_loss = self.crit(disc_fake_pred, torch.zeros_like(disc_fake_pred))  # fake image의 label은 0
 
-            # 100차원의 Gaussian distribution에서 샘플링한 노이즈 z만들기
-            z = torch.randn(100).to(device)
+        disc_real_pred = self.disc(real)
+        disc_real_loss = self.crit(disc_real_pred, torch.ones_like(disc_real_pred))  # real image의 label은 1
 
-            # discriminator optimizer 초기화
-            self.d_optimizer.zero_grad()
+        disc_loss = (disc_fake_loss + disc_real_loss) / 2  # discriminator loss 는 disc_fake_loss 와 disc_real_loss 의 평균
 
-            ### real image를 사용해서 BCE Loss 계산하기
+        return disc_loss
 
-            # 실제 이미지 D에 넣기
-            p_real = self.D(img_batch.view(-1, 28 * 28))
-            real_labels = torch.ones_like(p_real).to(device)
-            d_loss_real = self.criterion(p_real, real_labels)
+    def get_gen_loss(self, num_images):
+        fake_noise = get_noise(num_images, self.z_dim)  # 노이즈 생성
+        fake = self.gen(fake_noise)  # 가짜 이미지 생성
+        disc_fake_pred = self.disc(fake)
+        gen_loss = self.crit(disc_fake_pred, torch.ones_like(disc_fake_pred))  # 생성한 이미지의 label은 1
 
-            ### fake image를 사용해서 BCE Loss 계산하기
-
-            # 랜덤 노이즈 D에 넣기
-            p_fake = self.D(self.G(z))
-            fake_labels = torch.zeros_like(p_fake).to(device)
-            d_loss_fake = self.criterion(p_fake, fake_labels)
-
-            ### discriminator의 최종 loss
-            d_loss = d_loss_real + d_loss_fake
-
-            # 모멘텀 적용하고, 파라미터 업데이트하기
-            d_loss.backward()
-            self.d_optimizer.step()
-
-            # ====================================================== #
-            # generator training 하기
-            # ====================================================== #
-
-            # generator optimizer 초기화
-            self.g_optimizer.zero_grad()
-
-            # 100차원의 Gaussian distribution에서 샘플링한 노이즈 z만들기
-            z = torch.randn(100).to(device)
-            # fake image 만들기
-            p_fake = self.D(self.G(z))
-            real_labels = torch.ones_like(p_fake).to(device)
-            g_loss = self.criterion(p_fake, real_labels)
-
-            # 모멘텀 적용하고, 파라미터 업데이트 하기
-            g_loss.backward()
-            self.g_optimizer.step()
+        return gen_loss
 
     def train(self):
-        i = 0
-        for epoch in range(self.num_epochs):
-            i += 1
-            self._train()
-            print(str(i) + '번 째 epoch')
+        cur_step = 0
+        mean_generator_loss = 0
+        mean_discriminator_loss = 0
+        test_generator = True  # Whether the generator should be tested
+        gen_loss = False
 
-        torch.save({
-            'epoch': epoch,
-            'g_state_dict': self.G.state_dict(),
-            'd_state_dict': self.D.state_dict(),
-        }, './checkpoint.pt')
+        for epoch in range(self.n_epochs):
+            for real, _ in tqdm(self.dataloader):
+                cur_batch_size = len(real)  # 현재 배치 사이즈 저장
 
-    def test(self):
-        from matplotlib import pyplot as plt
+                # real을 flatten 하게 만든다.
+                real = real.view(cur_batch_size, -1).to(self.device)
 
-        with torch.no_grad():
-            checkpoint = torch.load('./checkpoint.pt')
+                ### Update discriminator ###
+                self.disc_opt.zero_grad()
+                disc_loss = self.get_disc_loss(real, cur_batch_size)
+                disc_loss.backward(retain_graph=True)  # retain_graph 알아보기
+                self.disc_opt.step()
 
-            G = Generator()
-            G.load_state_dict(checkpoint['g_state_dict'])
-            G.eval()
+                # For testing purposes, to keep track of the generator weights
+                if test_generator:
+                    old_generator_weights = self.gen.gen[0][0].weight.detach().clone()
+                    # generator의 가장 처음 weights 를 저장한다.
 
-            z = torch.randn(100).to(device)
-            img = G(z).view(28, 28, -1)
-            plt.imshow(img.numpy(), cmap='gray')
-            plt.savefig('savefig.png')
+                ### Update generator ###
+                self.gen_opt.zero_grad()
+                gen_loss = self.get_gen_loss(cur_batch_size)
+                gen_loss.backward()
+                self.gen_opt.step()
 
+                # For testing purposes, to check that your code changes the generator weights
+                if test_generator:
+                    assert torch.any(self.gen.gen[0][0].weight.detach().clone() != old_generator_weights)
+                    # torch.any(input) : input에는 Tensor가 들어간다. input 안의 수(or bool) 중에서 True가 하나 이상 있으면 tensor(True)를 반환한다.
+                    # 나의 코드가 generator weights를 변화시켰는지 확인한다.
 
-#     def evaluate(self):
+                # 딕셔너리는 items() 함수를 사용하면 딕셔너리에 있는 키와 값들의 쌍을 얻을 수 있다.
+                # >>> car = {"name": "BMW", "price": "8000"}
+                # >>> car.items()
+                # >>> dict_items([('name', 'BMW'), ('price', '7000')])
 
-#         p_real, p_fake = 0., 0.
+                # Keep track of the average discriminator loss
+                mean_discriminator_loss += disc_loss.item() / self.display_step
 
-#         self.G.eval()
-#         self.D.eval()
+                # Keep track of the average generator loss
+                mean_generator_loss += gen_loss.item() / self.display_step
 
-#         for img_batch, label_batch in self.test_loader:
-#             img_batch, label_batch = img_batch.to(device), label_batch.to(device)
+                ### Visualization code ###
+                if cur_step % self.display_step == 0 and cur_step > 0:
+                    print(
+                        f"Step {cur_step}: Generator loss: {mean_generator_loss}, discriminator loss: {mean_discriminator_loss}")
 
-#             with torch.autograd.no_grad():
-#                 p_real += (torch.sum(discriminator(img_batch.view(-1, 28*28))).item())/10000.
-#             p_fake += (torch.sum(discriminator(generator(sample_z(batch_size, d_noise)))).item())/10000.
+                    fake_noise = get_noise(cur_batch_size, self.z_dim)
+                    fake = self.gen(fake_noise)
+                    save_tensor_images("fake_" + str(cur_step), fake)
+                    save_tensor_images("real_" + str(cur_step), real)
+                    mean_generator_loss = 0
+                    mean_discriminator_loss = 0
 
-
-def main():
-    parser = argparse.ArgumentParser()
-
-    # parser.add_argument('--model_fn', required=True)
-    parser.add_argument('--gpu_id', type=int, default=-1)
-    parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--num_epochs', type=int, default=200)
-
-    parser.add_argument('--mode', default='train', type=str, choices=['train', 'test'])
-
-    args = parser.parse_args()
-    # print(args)
-
-    gan = GAN(args)
-
-    if args.mode == 'train':
-        gan.train()
-    else:
-        gan.test()
+                cur_step += 1
 
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument('--n_epochs', type=int, default=200)
+    parser.add_argument('--z_dim', type=int, default=64, help='a dimension of input noise')
+    parser.add_argument('--display_step', type=int, default=5, help='size of results is display_step * display_step')
+    parser.add_argument('--batch_size', type=int, default=32)
+    parser.add_argument('--lr', type=float, default=0.0001, help='learning rate')
+
+    args = parser.parse_args()
+
+    model = GAN(args)
+    model.train()
